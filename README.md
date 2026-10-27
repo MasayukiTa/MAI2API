@@ -1,10 +1,11 @@
 # MAI2API
 
 Use Microsoft's **MAI-Thinking-1** as a local API. MAI2API runs a small
-proxy on your PC that speaks the OpenAI (`/v1/chat/completions`) and
-Anthropic (`/v1/messages`) APIs and translates them to the Microsoft
-Playground web app, using **your own signed-in session**. Point Claude
-Code (or any OpenAI/Anthropic client) at it and the model answers —
+proxy on your PC that speaks the OpenAI (`/v1/chat/completions`),
+Anthropic (`/v1/messages`) and OpenAI Responses (`/v1/responses`)
+APIs and translates them to the Microsoft Playground web app, using
+**your own signed-in session**. Point Claude Code (or any
+OpenAI/Anthropic client) at it and the model answers —
 tools included, via emulation (see *Limits*).
 
 > Unofficial and unsupported. It drives a consumer web UI with your
@@ -46,10 +47,15 @@ python harvest_now.py --setup   # sign in once in the window that opens
 python selftest.py              # expect: SELFTEST OK
 ```
 
-`setup.ps1` registers logon auto-start for the guardian and the
-keeper and starts both. The one-time sign-in creates a dedicated
-browser profile in `edge-profile\`; after that, everything is
-unattended.
+`setup.ps1` creates a dedicated virtual environment, registers
+logon auto-start for the guardian and the keeper, and starts both.
+
+**Runtime state lives outside this folder**: the token, the
+dedicated browser profile, sessions, logs and pid files are kept in
+`%LOCALAPPDATA%\MAI2API` (override with the `MAI2API_STATE_DIR`
+environment variable), so the source tree never holds live
+credentials. The one-time sign-in creates the browser profile
+there; after that, everything is unattended.
 
 ## Daily use
 
@@ -60,14 +66,19 @@ mai-claude.cmd
 ```
 
 (It sets `ANTHROPIC_BASE_URL=http://127.0.0.1:18787`,
-`ANTHROPIC_API_KEY=dummy`, `ANTHROPIC_MODEL=sonnet` — the model name
-must be a Claude-catalog name; the proxy ignores it and always calls
-MAI-Thinking-1.) Any other client can use
-`http://127.0.0.1:18787/v1/chat/completions` directly.
+`ANTHROPIC_API_KEY=dummy`, `ANTHROPIC_MODEL=sonnet`.) Model names
+follow an explicit alias policy: any client-supplied name maps to
+the single upstream model, and responses always report the real
+upstream id (`mai-thinking-1-latest`). Set `MAI_PROXY_MODEL_STRICT=1`
+to reject names outside the known alias families with a 400 instead.
+Any other client can use `http://127.0.0.1:18787/v1/chat/completions`
+directly.
 
 Feeding a token from somewhere else also works: POST a raw Easy Auth
-`id_token` to `http://127.0.0.1:18787/__harvest`, or write it to
-`token.txt`.
+`id_token` to `http://127.0.0.1:18787/__harvest` with the
+`X-MAI-Harvest-Key` header (the key is generated on first run in the
+state directory, `harvest_key.txt`), or write the token to
+`token.txt` in the state directory.
 
 ## Optional: phone alerts
 
@@ -98,7 +109,15 @@ Windows toast is always attempted as well.
 | `mai-claude.cmd` | Claude Code launcher |
 
 Stop switches: create `guardian_stop.txt` / `rpa_stop.txt` /
-`harvest_stop.txt` in this folder to stand the respective piece down.
+`harvest_stop.txt` in the **state directory** to stand the
+respective piece down.
+
+Endpoints: `/v1/chat/completions`, `/v1/messages` (plus
+`count_tokens`, an approximation), `/v1/responses`, `/v1/models`,
+and the operational trio `/health` (token validity), `/health/live`
+(process liveness), `/health/ready` (503 until the token is valid),
+plus `/metrics` (request/upstream/auth counters as JSON). All
+responses stream truly: upstream deltas are flushed as they arrive.
 
 ## Limits (measured, honest)
 
@@ -110,21 +129,46 @@ Stop switches: create `guardian_stop.txt` / `rpa_stop.txt` /
   calling. The proxy teaches the model a text protocol and converts
   its replies into `tool_calls`/`tool_use`; execution happens in your
   client (e.g. Claude Code runs Read/Write/Bash/WebSearch itself).
-  Occasionally the model produces a malformed call — the cost of
-  emulation.
+  Calls are validated against the declared tools (name allowlist +
+  argument schema): an invalid call is fed back for one repair
+  attempt, then dropped — never executed blindly.
+- **Usage numbers are estimates**: the Playground reports no token
+  counts, so `usage` is estimated from character counts and marked
+  (`usage_estimated` / `"estimated": true`). It is never silently 0.
+- **Not supported**: image input, `previous_response_id` (rejected
+  with a 400 — send full input each time), exact token counting.
+  The legacy browser-extension harvester is superseded by the
+  headless keeper and is not needed.
 - **System prompts**: the Playground accepts only a short system
   field and largely ignores it, so the proxy folds system text and
   tool definitions into the conversation (cap via
   `MAI_PROXY_STUFF_CAP`, default 280k chars, oldest turns dropped).
 - **One machine, one account, localhost only.** The token and the
-  browser profile in this folder are credentials — they are
-  git-ignored; keep it that way.
+  browser profile in the state directory are credentials — they are
+  git-ignored and physically separated from the source; keep it
+  that way. `requests.log` records request lines only (method, path,
+  status) — never bodies or prompts.
 
 ## Troubleshooting
 
 - `selftest.py` says the token expired and nothing heals: the
   session needs a human again — run `python harvest_now.py --setup`.
 - Proxy down: the guardian restarts it within about a minute
-  (check `proxy.log`).
-- Keeper quiet: check `rpa_loop.log`; make sure no `rpa_stop.txt`
-  exists.
+  (check `proxy.log` in the state directory). A process that stays
+  alive but stops answering is terminated and restarted after ~5
+  minutes of failed liveness checks, capped at 3 per hour
+  (`guardian_state.json` records every restart).
+- Keeper quiet: check `rpa_loop.log` in the state directory; make
+  sure no `rpa_stop.txt` exists there.
+
+## Development
+
+```powershell
+python -m pytest tests -q   # 40+ unit tests, no network needed
+```
+
+Release checklist: pytest green · CI green · `selftest.py` OK on a
+real install · a streamed and a buffered completion through each
+surface (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`) ·
+`/health/ready` returns 503 with an expired token and 200 with a
+fresh one.

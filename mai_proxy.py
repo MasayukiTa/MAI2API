@@ -57,6 +57,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 UPSTREAM = "https://playground.microsoft.ai"
 MODEL = "mai-thinking-1-latest"
+__version__ = "1.0.0"
 PORT = int(os.environ.get("MAI_PROXY_PORT", "18787"))
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -1077,7 +1078,8 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/health", "/health/live", "/health/ready"):
             info = token_info()
             summary = {"ok": bool(info.get("valid")),
-                       "process": "ok", "token": info}
+                       "process": "ok", "version": __version__,
+                       "token": info}
             if path == "/health/live":
                 self._send(200, {"ok": True, "process": "ok"})
             elif path == "/health/ready":
