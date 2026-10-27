@@ -932,6 +932,73 @@ def anthropic_tools(tools):
     return out
 
 
+def turns_from_responses(body):
+    """Convert a Responses-API request into (system_text, turns,
+    tools). previous_response_id is deliberately unsupported: this
+    proxy is stateless per request, so the caller sends full input."""
+    system_parts = []
+    if body.get("instructions"):
+        system_parts.append(str(body["instructions"]))
+    turns = []
+    inp = body.get("input")
+    items = []
+    if isinstance(inp, str):
+        items = [{"type": "message", "role": "user", "content": inp}]
+    elif isinstance(inp, list):
+        items = inp
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        t = item.get("type", "message")
+        if t == "message":
+            role = item.get("role", "user")
+            content = item.get("content")
+            if isinstance(content, list):
+                content = "".join(
+                    p.get("text", "") for p in content
+                    if isinstance(p, dict)
+                    and p.get("type") in ("input_text", "output_text",
+                                          "text"))
+            content = content or ""
+            if role in ("system", "developer"):
+                system_parts.append(content)
+            elif role == "assistant":
+                if content:
+                    turns.append(("assistant", content))
+            else:
+                turns.append(("user", content))
+        elif t == "function_call":
+            args = item.get("arguments") or "{}"
+            turns.append(("assistant_tool",
+                          f'<mai_tool_call>{{"name": '
+                          f'{json.dumps(item.get("name"))}, '
+                          f'"input": {args}}}</mai_tool_call>'))
+        elif t == "function_call_output":
+            out = item.get("output")
+            turns.append(("tool_result",
+                          out if isinstance(out, str)
+                          else json.dumps(out or "")))
+    tools = []
+    for t in body.get("tools") or []:
+        if t.get("type") == "function" and t.get("name"):
+            tools.append({"type": "function", "function": {
+                "name": t.get("name"),
+                "description": t.get("description", ""),
+                "parameters": t.get("parameters") or {}}})
+    return "\n\n".join(system_parts), turns, tools
+
+
+def _responses_object(resp_id, output, in_est, out_est, status="completed"):
+    return {"id": resp_id, "object": "response",
+            "created_at": int(time.time()), "model": MODEL,
+            "status": status, "output": output,
+            "usage": {"input_tokens": in_est, "output_tokens": out_est,
+                      "total_tokens": in_est + out_est,
+                      "estimated": True},
+            "parallel_tool_calls": True, "tool_choice": "auto",
+            "temperature": None, "metadata": {}}
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -1079,6 +1146,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._openai(body)
             elif path == "/v1/messages":
                 self._anthropic(body)
+            elif path == "/v1/responses":
+                self._responses(body)
             elif path == "/v1/messages/count_tokens":
                 approx = len(json.dumps(body.get("messages") or [])) // 4
                 self._send(200, {"input_tokens": approx})
@@ -1385,6 +1454,182 @@ class Handler(BaseHTTPRequestHandler):
                       "completion_tokens": out_est,
                       "total_tokens": in_est + out_est},
             "usage_estimated": True})
+
+    def _responses(self, body):
+        if body.get("previous_response_id"):
+            self._send(400, {"error": {
+                "message": "previous_response_id is not supported by "
+                           "this proxy; send the full input on every "
+                           "request",
+                "type": "unsupported_parameter"}})
+            return
+        system_text, turns, tools = turns_from_responses(body)
+        extra = {}
+        if body.get("max_output_tokens") is not None:
+            extra["maxTokens"] = body["max_output_tokens"]
+        if body.get("stream"):
+            self._responses_stream(body, system_text, turns, tools, extra)
+            return
+        text = complete(system_text, turns, tools, extra)
+        before, call = parse_tool_call(text)
+        err = _validate_tool_call(call, tools)
+        if err:
+            _metric("tool_calls_rejected")
+            log_event("tool_call_rejected", reason=err,
+                      tool=(call or {}).get("name"))
+            _metric("tool_repairs")
+            fixed = _repair_call(system_text, turns, tools, extra,
+                                 text, err)
+            if fixed is not None:
+                b2, c2 = fixed
+                if c2 and not _validate_tool_call(c2, tools):
+                    before, call = b2, c2
+                elif not c2:
+                    before, call = b2, None
+                else:
+                    call = None
+            else:
+                call = None
+        output = []
+        resp_id = "resp_" + uuid.uuid4().hex[:24]
+        if before or not call:
+            output.append({
+                "type": "message", "id": "msg_" + uuid.uuid4().hex[:24],
+                "role": "assistant", "status": "completed",
+                "content": [{"type": "output_text", "text": before,
+                             "annotations": []}]})
+        if call:
+            output.append({
+                "type": "function_call",
+                "id": "fc_" + uuid.uuid4().hex[:24],
+                "call_id": "call_" + uuid.uuid4().hex[:24],
+                "name": call.get("name"),
+                "arguments": json.dumps(call.get("input") or {}),
+                "status": "completed"})
+        self._send(200, _responses_object(
+            resp_id, output,
+            _estimate_input(system_text, turns, tools),
+            _est_tokens(text)))
+
+    def _responses_stream(self, body, system_text, turns, tools, extra):
+        gen = complete_iter(system_text, turns, tools, extra)
+        filt = ToolBlockFilter()
+        pending, exhausted = self._prime_stream(gen, filt)
+        resp_id = "resp_" + uuid.uuid4().hex[:24]
+        msg_id = "msg_" + uuid.uuid4().hex[:24]
+        in_est = _estimate_input(system_text, turns, tools)
+
+        def ev(name, data):
+            payload = dict(data)
+            payload["type"] = name
+            self._sse_write(f"event: {name}\n"
+                            f"data: {json.dumps(payload)}\n\n")
+
+        self._sse_open()
+        try:
+            ev("response.created", {"response": _responses_object(
+                resp_id, [], in_est, 0, status="in_progress")})
+            msg_item = {"type": "message", "id": msg_id,
+                        "role": "assistant", "status": "in_progress",
+                        "content": []}
+            ev("response.output_item.added",
+               {"output_index": 0, "item": msg_item})
+            ev("response.content_part.added", {
+                "item_id": msg_id, "output_index": 0, "content_index": 0,
+                "part": {"type": "output_text", "text": "",
+                         "annotations": []}})
+            for safe in pending:
+                ev("response.output_text.delta", {
+                    "item_id": msg_id, "output_index": 0,
+                    "content_index": 0, "delta": safe})
+            if not exhausted:
+                for d in gen:
+                    safe = filt.feed(d)
+                    if safe:
+                        ev("response.output_text.delta", {
+                            "item_id": msg_id, "output_index": 0,
+                            "content_index": 0, "delta": safe})
+            full = filt.full_text
+            before, call = parse_tool_call(full)
+            rest = before[len(filt.emitted):] if call \
+                else full[len(filt.emitted):]
+            if rest:
+                ev("response.output_text.delta", {
+                    "item_id": msg_id, "output_index": 0,
+                    "content_index": 0, "delta": rest})
+            repair_text = ""
+            err = _validate_tool_call(call, tools)
+            if err:
+                _metric("tool_calls_rejected")
+                log_event("tool_call_rejected", reason=err,
+                          tool=(call or {}).get("name"))
+                _metric("tool_repairs")
+                fixed = _repair_call(system_text, turns, tools, extra,
+                                     full, err)
+                if fixed is not None:
+                    b2, c2 = fixed
+                    if c2 and not _validate_tool_call(c2, tools):
+                        repair_text, call = b2, c2
+                    elif not c2:
+                        repair_text, call = b2, None
+                    else:
+                        call = None
+                else:
+                    call = None
+            final_text = before + repair_text
+            if repair_text:
+                ev("response.output_text.delta", {
+                    "item_id": msg_id, "output_index": 0,
+                    "content_index": 0, "delta": repair_text})
+            ev("response.output_text.done", {
+                "item_id": msg_id, "output_index": 0,
+                "content_index": 0, "text": final_text})
+            ev("response.content_part.done", {
+                "item_id": msg_id, "output_index": 0, "content_index": 0,
+                "part": {"type": "output_text", "text": final_text,
+                         "annotations": []}})
+            msg_item = {"type": "message", "id": msg_id,
+                        "role": "assistant", "status": "completed",
+                        "content": [{"type": "output_text",
+                                     "text": final_text,
+                                     "annotations": []}]}
+            ev("response.output_item.done",
+               {"output_index": 0, "item": msg_item})
+            output = [msg_item]
+            if call:
+                fc = {"type": "function_call",
+                      "id": "fc_" + uuid.uuid4().hex[:24],
+                      "call_id": "call_" + uuid.uuid4().hex[:24],
+                      "name": call.get("name"),
+                      "arguments": json.dumps(call.get("input") or {}),
+                      "status": "completed"}
+                ev("response.output_item.added",
+                   {"output_index": 1, "item": dict(fc, status="in_progress",
+                                                   arguments="")})
+                ev("response.function_call_arguments.delta", {
+                    "item_id": fc["id"], "output_index": 1,
+                    "delta": fc["arguments"]})
+                ev("response.function_call_arguments.done", {
+                    "item_id": fc["id"], "output_index": 1,
+                    "arguments": fc["arguments"]})
+                ev("response.output_item.done",
+                   {"output_index": 1, "item": fc})
+                output.append(fc)
+            ev("response.completed", {"response": _responses_object(
+                resp_id, output, in_est,
+                _est_tokens(full + repair_text))})
+        except _ClientGone:
+            gen.close()
+            raise
+        except UpstreamError as e:
+            print(f"[proxy] upstream error mid-stream: {e.status}",
+                  flush=True)
+            try:
+                ev("response.failed", {"response": _responses_object(
+                    resp_id, [], in_est, 0, status="failed")})
+            except _ClientGone:
+                gen.close()
+                raise
 
     def _anthropic(self, body):
         system_text, turns = turns_from_anthropic(body.get("system"),

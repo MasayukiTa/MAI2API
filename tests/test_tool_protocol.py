@@ -127,3 +127,28 @@ class TestValidateToolCall:
         call = {"name": "Write", "input": "path=x"}
         assert "must be a JSON object" in mp._validate_tool_call(
             call, self.TOOLS)
+
+
+class TestResponsesConversion:
+    def test_string_input(self):
+        s, turns, tools = mp.turns_from_responses({"input": "hello"})
+        assert s == ""
+        assert turns == [("user", "hello")]
+        assert tools == []
+
+    def test_items_and_tools(self):
+        s, turns, tools = mp.turns_from_responses({
+            "instructions": "be terse",
+            "input": [
+                {"type": "message", "role": "user",
+                 "content": [{"type": "input_text", "text": "do it"}]},
+                {"type": "function_call", "call_id": "c1", "name": "Write",
+                 "arguments": "{\"path\": \"x\"}"},
+                {"type": "function_call_output", "call_id": "c1",
+                 "output": "ok"}],
+            "tools": [{"type": "function", "name": "Write",
+                       "parameters": {"type": "object"}}]})
+        assert s == "be terse"
+        assert [t[0] for t in turns] == ["user", "assistant_tool",
+                                          "tool_result"]
+        assert tools[0]["function"]["name"] == "Write"
