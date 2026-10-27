@@ -39,7 +39,7 @@ Claude Code ──► mai_proxy.py (127.0.0.1:18787)
 ## Setup (once)
 
 ```powershell
-git clone <this repo> MAI2API
+git clone https://github.com/MasayukiTa/MAI2API.git MAI2API
 cd MAI2API
 powershell -ExecutionPolicy Bypass -File .\setup.ps1
 python harvest_now.py --setup   # sign in once in the window that opens
