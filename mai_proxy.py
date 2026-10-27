@@ -123,6 +123,24 @@ def _maybe_rotate_requests_log():
         pass
 
 
+MODEL_STRICT = os.environ.get("MAI_PROXY_MODEL_STRICT") == "1"
+# Alias policy: by default any client-supplied model name is accepted
+# as an alias for the single upstream model (clients such as Claude
+# Code pin their own catalogue names), and every response reports
+# the REAL upstream model id. With MAI_PROXY_MODEL_STRICT=1, names
+# outside the known alias families are rejected with a 400 instead
+# of being silently mapped.
+MODEL_ALIAS_HINTS = ("mai-thinking-1", "sonnet", "opus", "haiku",
+                     "claude", "gpt-", "o1", "o3", "o4")
+
+
+def _model_rejected(name):
+    if not MODEL_STRICT or not name:
+        return False
+    n = str(name).lower()
+    return not any(h in n for h in MODEL_ALIAS_HINTS)
+
+
 def _harvest_key():
     try:
         with open(HARVEST_KEY_FILE, encoding="utf-8") as f:
@@ -259,6 +277,34 @@ def pace():
         _last_call[0] = time.time()
 
 
+_metrics = {"requests_total": 0, "by_route": {}, "by_status": {},
+            "upstream_429_retries": 0, "upstream_errors": 0,
+            "auth_waits": 0, "auth_unavailable": 0,
+            "client_cancellations": 0, "tool_repairs": 0,
+            "tool_calls_rejected": 0,
+            "started_at": int(time.time())}
+_mlock = threading.Lock()
+
+
+def _metric(key, n=1):
+    with _mlock:
+        _metrics[key] = _metrics.get(key, 0) + n
+
+
+def _metric_map(kind, name):
+    with _mlock:
+        _metrics[kind][name] = _metrics[kind].get(name, 0) + 1
+
+
+def log_event(event, **fields):
+    """One structured JSON line per notable event (request
+    completions, auth waits, rejected tool calls). Older free-text
+    prints remain for the rest; new events land here."""
+    rec = {"ts": int(time.time()), "event": event}
+    rec.update(fields)
+    print("[proxy] " + json.dumps(rec, ensure_ascii=False), flush=True)
+
+
 def _retry_after_seconds(headers):
     """Parse a Retry-After header (delta-seconds or HTTP-date)."""
     try:
@@ -307,6 +353,7 @@ def up(method, path, payload=None, stream=False, idempotent=False):
         except urllib.error.HTTPError as e:
             body = e.read().decode(errors="replace")[:400]
             if e.code == 429 and attempt429 < len(backoff):
+                _metric("upstream_429_retries")
                 wait = backoff[attempt429]
                 ra = _retry_after_seconds(e.headers)
                 if ra is not None:
@@ -487,6 +534,106 @@ def parse_tool_call(text):
     return before, call
 
 
+def _schema_errors(schema, value, path="$"):
+    """A small JSON-Schema subset validator (types, object
+    properties/required, array items, enum) -- enough to catch the
+    argument shapes a model actually gets wrong, with no deps."""
+    errs = []
+    if not isinstance(schema, dict):
+        return errs
+    enum = schema.get("enum")
+    if enum is not None and value not in enum:
+        errs.append(f"{path}: {value!r} is not one of {enum}")
+    t = schema.get("type")
+    if t == "object":
+        if not isinstance(value, dict):
+            return errs + [f"{path}: expected object"]
+        for req in schema.get("required") or []:
+            if req not in value:
+                errs.append(f"{path}.{req}: missing required property")
+        props = schema.get("properties") or {}
+        for k, sub in props.items():
+            if k in value:
+                errs.extend(_schema_errors(sub, value[k], f"{path}.{k}"))
+    elif t == "string":
+        if not isinstance(value, str):
+            errs.append(f"{path}: expected string")
+    elif t in ("number", "integer"):
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            errs.append(f"{path}: expected {t}")
+        elif t == "integer" and float(value) != int(value):
+            errs.append(f"{path}: expected integer")
+    elif t == "boolean":
+        if not isinstance(value, bool):
+            errs.append(f"{path}: expected boolean")
+    elif t == "array":
+        if not isinstance(value, list):
+            errs.append(f"{path}: expected array")
+        elif isinstance(schema.get("items"), dict):
+            for i, item in enumerate(value):
+                errs.extend(_schema_errors(schema["items"], item,
+                                           f"{path}[{i}]"))
+    return errs
+
+
+def _validate_tool_call(call, tools):
+    """None when the call is acceptable, else a human-readable
+    rejection reason. With no declared tools there is nothing to
+    validate against, so calls pass (documented behaviour)."""
+    if not call:
+        return None
+    declared = {}
+    for t in tools or []:
+        fn = t.get("function") or t
+        if fn.get("name"):
+            declared[fn["name"]] = fn.get("parameters") or \
+                fn.get("input_schema") or {}
+    if not declared:
+        return None
+    name = call.get("name")
+    if name not in declared:
+        return f"undeclared tool {name!r} (declared: {sorted(declared)})"
+    args = call.get("input")
+    if not isinstance(args, dict):
+        return f"arguments for {name} must be a JSON object"
+    errs = _schema_errors(declared[name], args)
+    if errs:
+        return f"invalid arguments for {name}: " + "; ".join(errs[:4])
+    return None
+
+
+def _repair_call(system_text, turns, tools, extra, bad_text, reason):
+    """One repair attempt after a rejected tool call: feed the
+    rejection back and let the model emit a valid call or a plain
+    answer. Returns (before, call) of the repaired reply, or None
+    when the repair itself failed upstream."""
+    feedback = ("[proxy] Your tool call was rejected: " + reason +
+                ". Reply with exactly one valid <mai_tool_call> block "
+                "for a declared tool whose arguments match its schema, "
+                "or answer in plain text without a tool call.")
+    try:
+        text = complete(system_text,
+                        list(turns) + [("assistant", bad_text),
+                                       ("user", feedback)],
+                        tools, extra)
+    except Exception:  # noqa: BLE001
+        return None
+    return parse_tool_call(text)
+
+
+def _est_tokens(text):
+    return max(1, len(text) // 4) if text else 0
+
+
+def _estimate_input(system_text, turns, tools):
+    total = len(system_text or "")
+    for _, t in turns:
+        total += len(t or "")
+    if tools:
+        total += len(json.dumps(tools))
+    return _est_tokens("x" * total)
+
+
 def turns_from_openai(messages):
     system_parts, turns = [], []
     for msg in messages:
@@ -619,7 +766,9 @@ def complete(system_text, turns, tools, extra):
         # window for the keeper / an on-demand harvest to land a
         # fresh token. If none lands, fail fast with a 503 instead
         # of feeding a dead token to the upstream and hanging.
+        _metric("auth_waits")
         if not wait_for_fresh_token():
+            _metric("auth_unavailable")
             raise AuthUnavailable(
                 "Playground session token could not be refreshed")
     tok_before = get_token()
@@ -646,7 +795,9 @@ def complete_iter(system_text, turns, tools, extra):
         raise ValueError("no messages")
     info = token_info()
     if not info.get("valid"):
+        _metric("auth_waits")
         if not wait_for_fresh_token():
+            _metric("auth_unavailable")
             raise AuthUnavailable(
                 "Playground session token could not be refreshed")
     tok_before = get_token()
@@ -796,6 +947,14 @@ class Handler(BaseHTTPRequestHandler):
         body = obj if isinstance(obj, (bytes, str)) else json.dumps(obj)
         if isinstance(body, str):
             body = body.encode()
+        if not getattr(self, "_counted", False):
+            self._counted = True
+            _metric_map("by_status", str(status))
+            log_event("request", id=getattr(self, "_req_id", "-"),
+                      method=self.command,
+                      path=self.path.split("?", 1)[0], status=status,
+                      ms=int((time.time() - getattr(self, "_t0",
+                                                    time.time())) * 1000))
         try:
             self.send_response(status)
             self.send_header("Content-Type", ctype)
@@ -831,6 +990,10 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        self._req_id = uuid.uuid4().hex[:12]
+        self._t0 = time.time()
+        _metric("requests_total")
+        _metric_map("by_route", "GET " + self.path.split("?", 1)[0])
         if not _inflight.acquire(blocking=False):
             self._send(503, {"error": {"message": "proxy overloaded",
                                        "type": "proxy_overloaded"}})
@@ -838,7 +1001,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self._do_GET()
         except _ClientGone:
-            pass
+            _metric("client_cancellations")
         finally:
             _inflight.release()
 
@@ -857,10 +1020,20 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/v1/models":
             self._send(200, {"object": "list", "data": [
                 {"id": MODEL, "object": "model", "owned_by": "microsoft-mai"}]})
+        elif path == "/metrics":
+            with _mlock:
+                snap = json.loads(json.dumps(_metrics))
+            snap["uptime_seconds"] = int(time.time()) - snap["started_at"]
+            snap["token_valid"] = bool(token_info().get("valid"))
+            self._send(200, snap)
         else:
             self._send(404, {"error": "not found"})
 
     def do_POST(self):
+        self._req_id = uuid.uuid4().hex[:12]
+        self._t0 = time.time()
+        _metric("requests_total")
+        _metric_map("by_route", "POST " + self.path.split("?", 1)[0])
         if not _inflight.acquire(blocking=False):
             self._send(503, {"error": {"message": "proxy overloaded",
                                        "type": "proxy_overloaded"}})
@@ -893,6 +1066,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, {"ok": True, "token_len": len(tok)})
                 return
             body = self._read_json()
+            if path in ("/v1/chat/completions", "/v1/messages",
+                        "/v1/responses") and \
+                    _model_rejected(body.get("model")):
+                self._send(400, {"error": {
+                    "message": f"model {body.get('model')!r} is not "
+                               f"served by this proxy (upstream: "
+                               f"{MODEL}); see the model alias policy",
+                    "type": "model_not_supported"}})
+                return
             if path == "/v1/chat/completions":
                 self._openai(body)
             elif path == "/v1/messages":
@@ -903,6 +1085,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._send(404, {"error": "not found"})
         except _ClientGone:
+            _metric("client_cancellations")
             print("[proxy] client disconnected; request unwound",
                   flush=True)
         except AuthUnavailable as e:
@@ -975,6 +1158,29 @@ class Handler(BaseHTTPRequestHandler):
             if rest:
                 self._sse_write("data: " + json.dumps(
                     chunk({"content": rest})) + "\n\n")
+            repair_text = ""
+            err = _validate_tool_call(call, body.get("tools"))
+            if err:
+                _metric("tool_calls_rejected")
+                log_event("tool_call_rejected", reason=err,
+                          tool=(call or {}).get("name"))
+                _metric("tool_repairs")
+                fixed = _repair_call(system_text, turns,
+                                     body.get("tools"), extra, full, err)
+                if fixed is not None:
+                    b2, c2 = fixed
+                    if c2 and not _validate_tool_call(c2,
+                                                      body.get("tools")):
+                        repair_text, call = b2, c2
+                    elif not c2:
+                        repair_text, call = b2, None
+                    else:
+                        call = None
+                else:
+                    call = None
+            if repair_text:
+                self._sse_write("data: " + json.dumps(
+                    chunk({"content": repair_text})) + "\n\n")
             finish = "stop"
             if call:
                 tc = [{"index": 0,
@@ -987,6 +1193,18 @@ class Handler(BaseHTTPRequestHandler):
                     chunk({"tool_calls": tc})) + "\n\n")
                 finish = "tool_calls"
             self._sse_write("data: " + json.dumps(chunk({}, finish)) + "\n\n")
+            if (body.get("stream_options") or {}).get("include_usage"):
+                in_est = _estimate_input(system_text, turns,
+                                         body.get("tools"))
+                out_est = _est_tokens(full + repair_text)
+                usage_chunk = {"id": cid_, "object": "chat.completion.chunk",
+                               "created": created, "model": MODEL,
+                               "choices": [],
+                               "usage": {"prompt_tokens": in_est,
+                                         "completion_tokens": out_est,
+                                         "total_tokens": in_est + out_est},
+                               "usage_estimated": True}
+                self._sse_write("data: " + json.dumps(usage_chunk) + "\n\n")
             self._sse_write("data: [DONE]\n\n")
         except _ClientGone:
             gen.close()
@@ -1020,8 +1238,10 @@ class Handler(BaseHTTPRequestHandler):
                             "role": "assistant", "model": MODEL,
                             "content": [], "stop_reason": None,
                             "stop_sequence": None,
-                            "usage": {"input_tokens": 0,
-                                      "output_tokens": 0}}})
+                            "usage": {"input_tokens": _estimate_input(
+                                          system_text, turns, tools),
+                                      "output_tokens": 0,
+                                      "estimated": True}}})
             idx = 0
             text_open = False
 
@@ -1049,6 +1269,27 @@ class Handler(BaseHTTPRequestHandler):
                 else full[len(filt.emitted):]
             if rest:
                 text_delta(rest)
+            repair_text = ""
+            err = _validate_tool_call(call, tools)
+            if err:
+                _metric("tool_calls_rejected")
+                log_event("tool_call_rejected", reason=err,
+                          tool=(call or {}).get("name"))
+                _metric("tool_repairs")
+                fixed = _repair_call(system_text, turns, tools, extra,
+                                     full, err)
+                if fixed is not None:
+                    b2, c2 = fixed
+                    if c2 and not _validate_tool_call(c2, tools):
+                        repair_text, call = b2, c2
+                    elif not c2:
+                        repair_text, call = b2, None
+                    else:
+                        call = None
+                else:
+                    call = None
+            if repair_text:
+                text_delta(repair_text)
             if text_open:
                 ev("content_block_stop", {
                     "type": "content_block_stop", "index": idx})
@@ -1078,7 +1319,8 @@ class Handler(BaseHTTPRequestHandler):
             ev("message_delta", {
                 "type": "message_delta",
                 "delta": {"stop_reason": stop, "stop_sequence": None},
-                "usage": {"output_tokens": 0}})
+                "usage": {"output_tokens": _est_tokens(full + repair_text),
+                          "estimated": True}})
             ev("message_stop", {"type": "message_stop"})
         except _ClientGone:
             gen.close()
@@ -1102,6 +1344,26 @@ class Handler(BaseHTTPRequestHandler):
             return
         text = complete(system_text, turns, body.get("tools"), extra)
         before, call = parse_tool_call(text)
+        err = _validate_tool_call(call, body.get("tools"))
+        if err:
+            _metric("tool_calls_rejected")
+            log_event("tool_call_rejected", reason=err,
+                      tool=(call or {}).get("name"))
+            _metric("tool_repairs")
+            fixed = _repair_call(system_text, turns, body.get("tools"),
+                                 extra, text, err)
+            if fixed is not None:
+                b2, c2 = fixed
+                if c2 and not _validate_tool_call(c2, body.get("tools")):
+                    before, call = b2, c2
+                elif not c2:
+                    before, call = b2, None
+                else:
+                    call = None  # still invalid: drop the call
+            else:
+                call = None
+        in_est = _estimate_input(system_text, turns, body.get("tools"))
+        out_est = _est_tokens(text)
         msg = {"role": "assistant", "content": before or None}
         finish = "stop"
         tool_calls = None
@@ -1119,8 +1381,10 @@ class Handler(BaseHTTPRequestHandler):
             "object": "chat.completion", "created": int(time.time()),
             "model": MODEL,
             "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0,
-                      "total_tokens": 0}})
+            "usage": {"prompt_tokens": in_est,
+                      "completion_tokens": out_est,
+                      "total_tokens": in_est + out_est},
+            "usage_estimated": True})
 
     def _anthropic(self, body):
         system_text, turns = turns_from_anthropic(body.get("system"),
@@ -1132,6 +1396,24 @@ class Handler(BaseHTTPRequestHandler):
             return
         text = complete(system_text, turns, tools, extra)
         before, call = parse_tool_call(text)
+        err = _validate_tool_call(call, tools)
+        if err:
+            _metric("tool_calls_rejected")
+            log_event("tool_call_rejected", reason=err,
+                      tool=(call or {}).get("name"))
+            _metric("tool_repairs")
+            fixed = _repair_call(system_text, turns, tools, extra,
+                                 text, err)
+            if fixed is not None:
+                b2, c2 = fixed
+                if c2 and not _validate_tool_call(c2, tools):
+                    before, call = b2, c2
+                elif not c2:
+                    before, call = b2, None
+                else:
+                    call = None
+            else:
+                call = None
         content = []
         if before:
             content.append({"type": "text", "text": before})
@@ -1149,7 +1431,10 @@ class Handler(BaseHTTPRequestHandler):
             "id": msg_id, "type": "message",
             "role": "assistant", "model": MODEL, "content": content,
             "stop_reason": stop, "stop_sequence": None,
-            "usage": {"input_tokens": 0, "output_tokens": 0}})
+            "usage": {"input_tokens": _estimate_input(system_text, turns,
+                                                     tools),
+                      "output_tokens": _est_tokens(text),
+                      "estimated": True}})
 
 
 class Server(ThreadingHTTPServer):

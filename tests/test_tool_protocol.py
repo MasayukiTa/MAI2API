@@ -91,3 +91,39 @@ class TestTurnConversion:
         system, turns = mp.turns_from_anthropic("be nice", msgs)
         assert system == "be nice"
         assert turns == [("user", "hi")]
+
+
+class TestValidateToolCall:
+    TOOLS = [{"type": "function", "function": {
+        "name": "Write",
+        "parameters": {"type": "object",
+                       "properties": {
+                           "path": {"type": "string"},
+                           "count": {"type": "integer"}},
+                       "required": ["path"]}}}]
+
+    def test_valid_call(self):
+        call = {"name": "Write", "input": {"path": "x", "count": 2}}
+        assert mp._validate_tool_call(call, self.TOOLS) is None
+
+    def test_undeclared_tool_rejected(self):
+        call = {"name": "Nuke", "input": {}}
+        assert "undeclared tool" in mp._validate_tool_call(call, self.TOOLS)
+
+    def test_missing_required_rejected(self):
+        call = {"name": "Write", "input": {"count": 1}}
+        assert "missing required" in mp._validate_tool_call(call, self.TOOLS)
+
+    def test_wrong_type_rejected(self):
+        call = {"name": "Write", "input": {"path": "x", "count": "two"}}
+        assert "expected integer" in mp._validate_tool_call(call, self.TOOLS)
+
+    def test_no_declared_tools_passes(self):
+        call = {"name": "Anything", "input": {}}
+        assert mp._validate_tool_call(call, []) is None
+        assert mp._validate_tool_call(call, None) is None
+
+    def test_non_object_arguments_rejected(self):
+        call = {"name": "Write", "input": "path=x"}
+        assert "must be a JSON object" in mp._validate_tool_call(
+            call, self.TOOLS)
