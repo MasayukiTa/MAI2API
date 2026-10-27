@@ -24,6 +24,11 @@ jobs:
       - name: Compile all modules
         run: python -m compileall -q .
 
+      - name: Unit tests
+        run: |
+          pip install pytest
+          python -m pytest tests -q
+
       - name: Guard - no tracked secrets or live state
         shell: pwsh
         run: |
@@ -35,7 +40,7 @@ jobs:
             $hits | ForEach-Object { Write-Error "must not be tracked: $_" }
             exit 1
           }
-          Write-Host "tracked-file guard: clean ($($tracked.Count) files)"
+          Write-Host "tracked-file guard: clean $($tracked.Count) files"
 
       - name: Guard - no credential-shaped content
         shell: pwsh
