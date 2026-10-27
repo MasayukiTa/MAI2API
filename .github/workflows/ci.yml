@@ -46,6 +46,7 @@ jobs:
             exit 1
           }
           Write-Host "content guard: clean"
+          exit 0
 
   gitleaks:
     runs-on: ubuntu-latest
