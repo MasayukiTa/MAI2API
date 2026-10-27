@@ -27,3 +27,8 @@ guardian_stop.txt
 # local experiments and scratch
 local-rd/
 *_out.txt
+# local review / audit notes (not committed)
+/docs/local/
+
+harvest_key.txt
+guardian_state.json

@@ -49,10 +49,25 @@ except Exception:
     pass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-PROFILE = os.path.join(HERE, "edge-profile")
+
+
+def _state_dir():
+    """Runtime state lives outside the source tree:
+    %LOCALAPPDATA%\\MAI2API by default, or MAI2API_STATE_DIR."""
+    env = os.environ.get("MAI2API_STATE_DIR")
+    if env:
+        return env
+    lad = os.environ.get("LOCALAPPDATA")
+    if lad:
+        return os.path.join(lad, "MAI2API")
+    return HERE
+
+
+STATE_DIR = _state_dir()
+PROFILE = os.path.join(STATE_DIR, "edge-profile")
 CDP_PORT = 9231
 PROXY_PORT = int(os.environ.get("MAI2API_PORT", "18787"))
-PIDFILE = os.path.join(HERE, "headless_edge.pid")
+PIDFILE = os.path.join(STATE_DIR, "headless_edge.pid")
 PLAYGROUND = "https://playground.microsoft.ai/chat?model=mai-thinking-1-latest"
 LOGIN = ("https://playground.microsoft.ai/.auth/login/aad"
          "?post_login_redirect_uri=%2Fchat%3Fmodel%3Dmai-thinking-1-latest")
@@ -98,6 +113,26 @@ def jwt_exp(tok):
         return 0
 
 
+def _harvest_key():
+    try:
+        with open(os.path.join(STATE_DIR, "harvest_key.txt"),
+                  encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def harvest_post(tok):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{PROXY_PORT}/__harvest", method="POST",
+        data=tok.encode())
+    key = _harvest_key()
+    if key:
+        req.add_header("X-MAI-Harvest-Key", key)
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return r.status
+
+
 def http_json(url, method="GET", timeout=10):
     req = urllib.request.Request(url, method=method)
     with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -131,7 +166,7 @@ def ensure_edge():
     args = [edge_exe(), f"--user-data-dir={PROFILE}",
             f"--remote-debugging-port={CDP_PORT}"] + EDGE_FLAGS + ["about:blank"]
     DETACHED = 0x00000008 | 0x00000200
-    log = open(os.path.join(HERE, "headless_edge.log"), "ab")
+    log = open(os.path.join(STATE_DIR, "headless_edge.log"), "ab")
     p = subprocess.Popen(args, creationflags=DETACHED,
                          stdin=subprocess.DEVNULL, stdout=log, stderr=log)
     with open(PIDFILE, "w") as f:
@@ -236,16 +271,13 @@ def main():
         # Periodic mode: harvest every 4 minutes (the cadence the
         # extension used), standing down when harvest_stop.txt exists.
         # The Edge stays resident; each pass is idempotent.
-        stop = os.path.join(HERE, "harvest_stop.txt")
+        stop = os.path.join(STATE_DIR, "harvest_stop.txt")
         while not os.path.exists(stop):
             try:
                 ensure_edge()
                 tok = asyncio.run(harvest_once())
                 if tok:
-                    req = urllib.request.Request(
-                        f"http://127.0.0.1:{PROXY_PORT}/__harvest",
-                        method="POST", data=tok.encode())
-                    urllib.request.urlopen(req, timeout=15).read()
+                    harvest_post(tok)
                     h = http_json(f"http://127.0.0.1:{PROXY_PORT}/health")
                     print("loop harvest ok, seconds_left:",
                           (h.get("token") or {}).get("seconds_left"),
@@ -266,11 +298,7 @@ def main():
         print("NEEDS_SIGNIN: no id_token from /.auth/me (profile session "
               "is signed out or waiting on an interactive prompt)")
         return 2
-    req = urllib.request.Request(
-        f"http://127.0.0.1:{PROXY_PORT}/__harvest", method="POST",
-        data=tok.encode())
-    with urllib.request.urlopen(req, timeout=15) as r:
-        print("harvest POST ->", r.status)
+    print("harvest POST ->", harvest_post(tok))
     h = http_json(f"http://127.0.0.1:{PROXY_PORT}/health")
     left = (h.get("token") or {}).get("seconds_left")
     print(f"proxy token seconds_left: {left}")

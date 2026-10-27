@@ -39,12 +39,27 @@ except Exception:
     pass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-PROFILE = os.path.join(HERE, "edge-profile")
+
+
+def _state_dir():
+    """Runtime state lives outside the source tree:
+    %LOCALAPPDATA%\\MAI2API by default, or MAI2API_STATE_DIR."""
+    env = os.environ.get("MAI2API_STATE_DIR")
+    if env:
+        return env
+    lad = os.environ.get("LOCALAPPDATA")
+    if lad:
+        return os.path.join(lad, "MAI2API")
+    return HERE
+
+
+STATE_DIR = _state_dir()
+PROFILE = os.path.join(STATE_DIR, "edge-profile")
 CDP_PORT = 9231
 PROXY_PORT = int(os.environ.get("MAI2API_PORT", "18787"))
-PIDFILE = os.path.join(HERE, "rpa_edge.pid")
-HINTS = os.path.join(HERE, "rpa_hints.json")
-STOP = os.path.join(HERE, "rpa_stop.txt")
+PIDFILE = os.path.join(STATE_DIR, "rpa_edge.pid")
+HINTS = os.path.join(STATE_DIR, "rpa_hints.json")
+STOP = os.path.join(STATE_DIR, "rpa_stop.txt")
 PLAYGROUND = "https://playground.microsoft.ai/chat?model=mai-thinking-1-latest"
 LOGIN = ("https://playground.microsoft.ai/.auth/login/aad"
          "?post_login_redirect_uri=%2Fchat%3Fmodel%3Dmai-thinking-1-latest")
@@ -111,7 +126,7 @@ def ensure_edge():
                 break
     args = [exe or "msedge.exe", f"--user-data-dir={PROFILE}",
             f"--remote-debugging-port={CDP_PORT}"] + EDGE_FLAGS + ["about:blank"]
-    log = open(os.path.join(HERE, "rpa_edge.log"), "ab")
+    log = open(os.path.join(STATE_DIR, "rpa_edge.log"), "ab")
     p = subprocess.Popen(args, creationflags=0x00000008 | 0x00000200,
                          stdin=subprocess.DEVNULL, stdout=log, stderr=log)
     with open(PIDFILE, "w") as f:
@@ -300,10 +315,22 @@ async def keeper_pass(force_login=False):
         return tok, entry
 
 
+def _harvest_key():
+    try:
+        with open(os.path.join(STATE_DIR, "harvest_key.txt"),
+                  encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
 def deliver(tok, entry):
     req = urllib.request.Request(
         f"http://127.0.0.1:{PROXY_PORT}/__harvest", method="POST",
         data=tok.encode())
+    key = _harvest_key()
+    if key:
+        req.add_header("X-MAI-Harvest-Key", key)
     urllib.request.urlopen(req, timeout=15).read()
     h = http_json(f"http://127.0.0.1:{PROXY_PORT}/health")
     left = (h.get("token") or {}).get("seconds_left")
@@ -328,7 +355,7 @@ except Exception:  # notification is an add-on; never block the keeper
         print(f"notify unavailable [{event}] {detail}", flush=True)
         return False
 
-STATE = os.path.join(HERE, "keeper_state.json")
+STATE = os.path.join(STATE_DIR, "keeper_state.json")
 ALERT_EVERY = 6 * 3600  # re-alert at most every 6h while a state holds
 
 
@@ -447,7 +474,7 @@ def main():
             return 0
         # From here the loop owns its log file (with rotation); the
         # launcher's shell redirect only captured startup lines.
-        _log = _RotatingStdout(os.path.join(HERE, "rpa_loop.log"))
+        _log = _RotatingStdout(os.path.join(STATE_DIR, "rpa_loop.log"))
         sys.stdout = _log
         sys.stderr = _log
         interval = 240

@@ -23,7 +23,17 @@ except Exception:
     pass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CONFIG = os.path.join(HERE, "notify_config.json")
+def _state_dir():
+    env = os.environ.get("MAI2API_STATE_DIR")
+    if env:
+        return env
+    lad = os.environ.get("LOCALAPPDATA")
+    if lad:
+        return os.path.join(lad, "MAI2API")
+    return HERE
+
+
+CONFIG = os.path.join(_state_dir(), "notify_config.json")
 
 TOAST_PS = r"""
 [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null

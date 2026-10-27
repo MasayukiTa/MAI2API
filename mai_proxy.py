@@ -42,6 +42,7 @@ its DevTools console pushes a fresh token to the proxy:
 Stdlib only. Binds 127.0.0.1 only.
 """
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -58,8 +59,28 @@ UPSTREAM = "https://playground.microsoft.ai"
 MODEL = "mai-thinking-1-latest"
 PORT = int(os.environ.get("MAI_PROXY_PORT", "18787"))
 _HERE = os.path.dirname(os.path.abspath(__file__))
-TOKEN_FILE = os.environ.get("MAI_TOKEN_FILE", os.path.join(_HERE, "token.txt"))
-REQUESTS_LOG = os.path.join(_HERE, "requests.log")
+
+
+def _state_dir():
+    """Runtime state (token, sessions, logs, keys) lives OUTSIDE the
+    source tree: %LOCALAPPDATA%\\MAI2API by default, or the directory
+    named by MAI2API_STATE_DIR. Credentials and the source tree stay
+    physically separate, so zipping or copying the repo can never
+    carry a live token with it."""
+    env = os.environ.get("MAI2API_STATE_DIR")
+    if env:
+        return env
+    lad = os.environ.get("LOCALAPPDATA")
+    if lad:
+        return os.path.join(lad, "MAI2API")
+    return _HERE
+
+
+STATE_DIR = _state_dir()
+TOKEN_FILE = os.environ.get("MAI_TOKEN_FILE",
+                            os.path.join(STATE_DIR, "token.txt"))
+REQUESTS_LOG = os.path.join(STATE_DIR, "requests.log")
+HARVEST_KEY_FILE = os.path.join(STATE_DIR, "harvest_key.txt")
 PACE_SECONDS = float(os.environ.get("MAI_PROXY_PACE", "1.2"))
 
 _state_lock = threading.Lock()
@@ -67,7 +88,7 @@ _last_call = [0.0]
 _sessions = {}  # key -> {"cid","last","turns":[(role, text), ...]}
 
 # --- hardening knobs (all optional, env-overridable) ---
-SESSIONS_FILE = os.path.join(_HERE, "sessions.json")
+SESSIONS_FILE = os.path.join(STATE_DIR, "sessions.json")
 MAX_STREAMS = int(os.environ.get("MAI_PROXY_MAX_STREAMS", "3"))
 _stream_sem = threading.Semaphore(MAX_STREAMS)
 MAX_INFLIGHT = int(os.environ.get("MAI_PROXY_MAX_INFLIGHT", "8"))
@@ -100,6 +121,30 @@ def _maybe_rotate_requests_log():
                     os.replace(src, dst)
     except OSError:
         pass
+
+
+def _harvest_key():
+    try:
+        with open(HARVEST_KEY_FILE, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _ensure_harvest_key():
+    """Create the local harvest secret on first run. /__harvest is
+    localhost-only, but any same-user process could otherwise inject
+    a bogus token; the keeper and harvester present this key."""
+    k = _harvest_key()
+    if not k:
+        import secrets
+        k = secrets.token_hex(32)
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = HARVEST_KEY_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(k)
+        os.replace(tmp, HARVEST_KEY_FILE)
+    return k
 
 
 def get_token():
@@ -146,7 +191,7 @@ def _maybe_spawn_harvest():
         return
     script = os.path.join(_HERE, "headless_harvest.py")
     if not (os.path.exists(script)
-            and os.path.isdir(os.path.join(_HERE, "edge-profile"))):
+            and os.path.isdir(os.path.join(STATE_DIR, "edge-profile"))):
         return
     _last_harvest_spawn[0] = now
     try:
@@ -829,6 +874,11 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         try:
             if path == "/__harvest":
+                sent = self.headers.get("X-MAI-Harvest-Key", "")
+                if not hmac.compare_digest(sent, _harvest_key()):
+                    self._send(403, {"error": "bad or missing "
+                                             "harvest key"})
+                    return
                 n = int(self.headers.get("Content-Length", 0))
                 tok = self.rfile.read(n).decode().strip()
                 if tok.count(".") != 2 or len(tok) < 100:
@@ -1113,7 +1163,9 @@ class Server(ThreadingHTTPServer):
         super().handle_error(request, client_address)
 
 if __name__ == "__main__":
+    os.makedirs(STATE_DIR, exist_ok=True)
     os.makedirs(os.path.dirname(TOKEN_FILE), exist_ok=True)
+    _ensure_harvest_key()
     _load_sessions()
     srv = Server(("127.0.0.1", PORT), Handler)
     print(f"mai_proxy on http://127.0.0.1:{PORT}  token_file={TOKEN_FILE} "

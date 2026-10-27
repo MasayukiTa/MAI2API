@@ -34,10 +34,25 @@ import time
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _state_dir():
+    """Runtime state lives outside the source tree:
+    %LOCALAPPDATA%\\MAI2API by default, or MAI2API_STATE_DIR."""
+    env = os.environ.get("MAI2API_STATE_DIR")
+    if env:
+        return env
+    lad = os.environ.get("LOCALAPPDATA")
+    if lad:
+        return os.path.join(lad, "MAI2API")
+    return HERE
+
+
+STATE_DIR = _state_dir()
 PROXY = os.path.join(HERE, "mai_proxy.py")
-PIDFILE = os.path.join(HERE, "proxy.pid")
-STOPFILE = os.path.join(HERE, "guardian_stop.txt")
-STATE = os.path.join(HERE, "guardian_state.json")
+PIDFILE = os.path.join(STATE_DIR, "proxy.pid")
+STOPFILE = os.path.join(STATE_DIR, "guardian_stop.txt")
+STATE = os.path.join(STATE_DIR, "guardian_state.json")
 PORT = os.environ.get("MAI_PROXY_PORT", "18787")
 LIVE = f"http://127.0.0.1:{PORT}/health/live"
 WEDGE_POLLS = int(os.environ.get("MAI2API_GUARDIAN_WEDGE_POLLS", "10"))
@@ -89,13 +104,13 @@ def rotate_log(path):
 
 
 def start_proxy(reason):
-    rotate_log(os.path.join(HERE, "proxy.log"))
-    rotate_log(os.path.join(HERE, "requests.log"))
+    rotate_log(os.path.join(STATE_DIR, "proxy.log"))
+    rotate_log(os.path.join(STATE_DIR, "requests.log"))
     pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
     if not os.path.exists(pyw):
         pyw = sys.executable
     DETACHED = 0x00000008 | 0x00000200
-    log = open(os.path.join(HERE, "proxy.log"), "ab")
+    log = open(os.path.join(STATE_DIR, "proxy.log"), "ab")
     p = subprocess.Popen([pyw, PROXY], creationflags=DETACHED,
                          stdin=subprocess.DEVNULL, stdout=log, stderr=log)
     with open(PIDFILE, "w") as f:

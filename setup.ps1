@@ -23,6 +23,31 @@ if ($LASTEXITCODE -ne 0) {
     & $py -m pip install websockets
 }
 
+# --- runtime state directory (outside the source tree) ---
+# Token, browser profile, sessions and logs live in
+# %LOCALAPPDATA%\MAI2API (or $env:MAI2API_STATE_DIR when set), so the
+# source folder never holds live credentials.
+$state = $env:MAI2API_STATE_DIR
+if (-not $state) { $state = Join-Path $env:LOCALAPPDATA "MAI2API" }
+New-Item -ItemType Directory -Path $state -Force | Out-Null
+# One-time migration from older installs that kept state in-tree:
+foreach ($name in "token.txt", "sessions.json", "notify_config.json",
+                   "keeper_state.json", "rpa_hints.json") {
+    $old = Join-Path $here $name
+    $new = Join-Path $state $name
+    if ((Test-Path $old) -and -not (Test-Path $new)) {
+        Copy-Item $old $new
+        Write-Host "Migrated $name to the state directory."
+    }
+}
+$oldProfile = Join-Path $here "edge-profile"
+$newProfile = Join-Path $state "edge-profile"
+if ((Test-Path $oldProfile) -and -not (Test-Path $newProfile)) {
+    Copy-Item $oldProfile $newProfile -Recurse
+    Write-Host "Migrated the browser profile to the state directory."
+}
+Write-Host "State directory: $state"
+
 # --- auto-start at logon (HKCU Run keys, no elevation needed) ---
 # The guardian supervises the proxy; the keeper supervises the token.
 $runKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
