@@ -70,6 +70,13 @@ _sessions = {}  # key -> {"cid","last","turns":[(role, text), ...]}
 SESSIONS_FILE = os.path.join(_HERE, "sessions.json")
 MAX_STREAMS = int(os.environ.get("MAI_PROXY_MAX_STREAMS", "3"))
 _stream_sem = threading.Semaphore(MAX_STREAMS)
+MAX_INFLIGHT = int(os.environ.get("MAI_PROXY_MAX_INFLIGHT", "8"))
+_inflight = threading.BoundedSemaphore(MAX_INFLIGHT)
+
+
+class _ClientGone(Exception):
+    """The client disconnected mid-response. Unwinds quietly: a
+    cancelled request is normal operation, not a proxy error."""
 STUFF_CHAR_CAP = int(os.environ.get("MAI_PROXY_STUFF_CAP", "280000"))
 TOKEN_WAIT_SECONDS = int(os.environ.get("MAI_PROXY_TOKEN_WAIT", "90"))
 
@@ -186,6 +193,27 @@ def pace():
         _last_call[0] = time.time()
 
 
+def _retry_after_seconds(headers):
+    """Parse a Retry-After header (delta-seconds or HTTP-date)."""
+    try:
+        v = headers.get("Retry-After")
+    except Exception:  # noqa: BLE001
+        return None
+    if not v:
+        return None
+    v = v.strip()
+    if v.isdigit():
+        return int(v)
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(v)
+        if dt is not None:
+            return max(0, int(dt.timestamp() - time.time()))
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
 def up(method, path, payload=None, stream=False, idempotent=False):
     pace()
     data = json.dumps(payload).encode() if payload is not None else None
@@ -213,9 +241,13 @@ def up(method, path, payload=None, stream=False, idempotent=False):
         except urllib.error.HTTPError as e:
             body = e.read().decode(errors="replace")[:400]
             if e.code == 429 and attempt429 < len(backoff):
+                wait = backoff[attempt429]
+                ra = _retry_after_seconds(e.headers)
+                if ra is not None:
+                    wait = min(max(wait, ra), 120)
                 print(f"[proxy] 429 on {path}; retry {attempt429 + 1} "
-                      f"in {backoff[attempt429]}s", flush=True)
-                time.sleep(backoff[attempt429])
+                      f"in {wait}s", flush=True)
+                time.sleep(wait)
                 attempt429 += 1
                 continue
             if (idempotent and e.code in (502, 503, 504)
@@ -292,6 +324,16 @@ def stream_upstream(cid, mid, extra):
 
 def run_turn(cid, last_mid, text, extra):
     """One full user turn; returns (assistant_text, model_message_id)."""
+    sink = {}
+    for _ in run_turn_iter(cid, last_mid, text, extra, sink):
+        pass
+    return sink["text"], sink["mid"]
+
+
+def run_turn_iter(cid, last_mid, text, extra, sink):
+    """Streaming variant of run_turn: yields assistant text deltas as
+    the upstream produces them; on completion sink holds the full
+    text and the model message id (for session-bridge bookkeeping)."""
     data = trpc("conversations.addPromptAndInitResponse", {
         "conversationId": cid, "text": text, "modelId": MODEL,
         "lastMessageId": last_mid})
@@ -299,7 +341,46 @@ def run_turn(cid, last_mid, text, extra):
     parts = []
     for delta in stream_upstream(cid, mid, extra):
         parts.append(delta)
-    return "".join(parts), mid
+        yield delta
+    sink["text"] = "".join(parts)
+    sink["mid"] = mid
+
+
+TOOL_TAG = "<mai_tool_call>"
+
+
+class ToolBlockFilter:
+    """Incremental splitter for streamed replies. Text that is
+    certainly reply text is emitted immediately; a trailing suffix
+    that could still grow into a <mai_tool_call> block (or the block
+    itself and anything after it) is held back for the final parse,
+    so a tool call is never half-shown as prose."""
+
+    def __init__(self):
+        self.buf = ""
+        self.emitted = ""
+
+    def feed(self, delta):
+        self.buf += delta
+        idx = self.buf.find(TOOL_TAG)
+        if idx >= 0:
+            safe = self.buf[:idx]
+            self.buf = self.buf[idx:]
+            self.emitted += safe
+            return safe
+        hold = 0
+        for k in range(min(len(self.buf), len(TOOL_TAG) - 1), 0, -1):
+            if self.buf.endswith(TOOL_TAG[:k]):
+                hold = k
+                break
+        safe = self.buf[:len(self.buf) - hold] if hold else self.buf
+        self.buf = self.buf[len(safe):]
+        self.emitted += safe
+        return safe
+
+    @property
+    def full_text(self):
+        return self.emitted + self.buf
 
 
 TOOL_BLOCK_RE = re.compile(r"<mai_tool_call>\s*(\{.*?\})\s*</mai_tool_call>", re.S)
@@ -489,6 +570,92 @@ def complete(system_text, turns, tools, extra):
             return _complete_inner(system_text, turns, tools, extra)
 
 
+def complete_iter(system_text, turns, tools, extra):
+    """Streaming variant of complete(): yields reply-text deltas as
+    they arrive. Token gating matches complete(); the single
+    auth retry can only substitute a fresh stream before the first
+    delta has been yielded (after that the client already has bytes
+    and a restart would corrupt the response)."""
+    if not turns:
+        raise ValueError("no messages")
+    info = token_info()
+    if not info.get("valid"):
+        if not wait_for_fresh_token():
+            raise AuthUnavailable(
+                "Playground session token could not be refreshed")
+    tok_before = get_token()
+    with _stream_sem:
+        yielded = False
+        retried = False
+        while True:
+            try:
+                for d in _complete_inner_iter(system_text, turns,
+                                              tools, extra):
+                    yielded = True
+                    yield d
+                return
+            except UpstreamError as e:
+                if e.status in (401, 403) and not yielded and not retried:
+                    retried = True
+                    print("[proxy] upstream auth error before first "
+                          "delta; waiting for a fresh token, then "
+                          "retrying once", flush=True)
+                    if not wait_for_fresh_token(old_value=tok_before,
+                                                timeout=90):
+                        raise
+                    continue
+                raise
+
+
+def _complete_inner_iter(system_text, turns, tools, extra):
+    """Yielding twin of _complete_inner (same session-bridge rules)."""
+    tools_block = format_tools_openai(tools) if tools else ""
+    key = session_key(system_text, turns, tools_block)
+    sess = _sessions.get(key)
+    new_text = None
+    if sess:
+        known = sess["turns"]
+        if len(turns) > len(known) and turns[:len(known)] == known:
+            delta = turns[len(known):]
+            user_delta = [t for t in delta if t[0] in ("user", "tool_result")]
+            asst_known = [t for t in delta if t[0] in ("assistant", "assistant_tool")]
+            if len(user_delta) == 1 and not asst_known:
+                new_text = render_turn_text(*user_delta[0])
+    if sess and new_text is not None:
+        sink = {}
+        try:
+            for d in run_turn_iter(sess["cid"], sess["last"],
+                                   new_text, extra, sink):
+                yield d
+        except (UpstreamError, GeneratorExit):
+            # Same rule as the buffered path (plus client disconnect):
+            # the upstream conversation may now hold an unanswered
+            # user turn, so drop the bridge and let the next attempt
+            # restuff into a fresh conversation.
+            print("[proxy] delta turn failed/closed; dropping session "
+                  "bridge", flush=True)
+            _sessions.pop(key, None)
+            _save_sessions()
+            raise
+        sess["turns"] = turns + [("assistant", sink["text"])]
+        sess["last"] = sink["mid"]
+        _save_sessions()
+        return
+    data = trpc("conversations.create", {"title": "mai-proxy", "modelId": MODEL},
+                idempotent=True)
+    cid = data["id"]
+    first_extra = dict(extra or {})
+    body_text = flatten_for_transcript(system_text, turns, tools_block)
+    turn_extra = dict(first_extra)
+    turn_extra["isFirstMessage"] = True
+    sink = {}
+    for d in run_turn_iter(cid, None, body_text, turn_extra, sink):
+        yield d
+    _sessions[key] = {"cid": cid, "last": sink["mid"],
+                      "turns": turns + [("assistant", sink["text"])]}
+    _save_sessions()
+
+
 def _complete_inner(system_text, turns, tools, extra):
     tools_block = format_tools_openai(tools) if tools else ""
     key = session_key(system_text, turns, tools_block)
@@ -562,11 +729,30 @@ class Handler(BaseHTTPRequestHandler):
         body = obj if isinstance(obj, (bytes, str)) else json.dumps(obj)
         if isinstance(body, str):
             body = body.encode()
-        self.send_response(status)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            raise _ClientGone()
+
+    def _sse_open(self):
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+        except (BrokenPipeError, ConnectionResetError):
+            raise _ClientGone()
+
+    def _sse_write(self, text):
+        try:
+            self.wfile.write(text.encode())
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            raise _ClientGone()
 
     def _read_json(self):
         n = int(self.headers.get("Content-Length", 0))
@@ -578,6 +764,18 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        if not _inflight.acquire(blocking=False):
+            self._send(503, {"error": {"message": "proxy overloaded",
+                                       "type": "proxy_overloaded"}})
+            return
+        try:
+            self._do_GET()
+        except _ClientGone:
+            pass
+        finally:
+            _inflight.release()
+
+    def _do_GET(self):
         path = self.path.split("?", 1)[0]
         if path in ("/health", "/health/live", "/health/ready"):
             info = token_info()
@@ -596,6 +794,16 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": "not found"})
 
     def do_POST(self):
+        if not _inflight.acquire(blocking=False):
+            self._send(503, {"error": {"message": "proxy overloaded",
+                                       "type": "proxy_overloaded"}})
+            return
+        try:
+            self._do_POST()
+        finally:
+            _inflight.release()
+
+    def _do_POST(self):
         path = self.path.split("?", 1)[0]
         try:
             if path == "/__harvest":
@@ -622,6 +830,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, {"input_tokens": approx})
             else:
                 self._send(404, {"error": "not found"})
+        except _ClientGone:
+            print("[proxy] client disconnected; request unwound",
+                  flush=True)
         except AuthUnavailable as e:
             self._send(503, {"error": {"message": str(e),
                                        "type": "mai_auth_unavailable"}})
@@ -642,18 +853,182 @@ class Handler(BaseHTTPRequestHandler):
             extra["maxTokens"] = body["max_tokens"]
         return extra
 
-    def _send_sse(self, events):
-        body = "".join(f"event: {name}\ndata: {json.dumps(data)}\n\n"
-                       for name, data in events).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+    def _prime_stream(self, gen, filt):
+        """Pull deltas until the first safe text chunk exists (or the
+        stream ends). Errors raised here happen BEFORE any SSE bytes
+        are written, so they still surface as normal JSON errors."""
+        pending = []
+        exhausted = False
+        try:
+            while True:
+                d = next(gen)
+                safe = filt.feed(d)
+                if safe:
+                    pending.append(safe)
+                    break
+        except StopIteration:
+            exhausted = True
+        return pending, exhausted
+
+    def _openai_stream(self, body, system_text, turns, extra):
+        gen = complete_iter(system_text, turns, body.get("tools"), extra)
+        filt = ToolBlockFilter()
+        pending, exhausted = self._prime_stream(gen, filt)
+        cid_ = "chatcmpl-" + uuid.uuid4().hex[:24]
+        created = int(time.time())
+
+        def chunk(delta, finish=None):
+            return {"id": cid_, "object": "chat.completion.chunk",
+                    "created": created, "model": MODEL,
+                    "choices": [{"index": 0, "delta": delta,
+                                 "finish_reason": finish}]}
+
+        self._sse_open()
+        try:
+            self._sse_write("data: " + json.dumps(
+                chunk({"role": "assistant"})) + "\n\n")
+            for safe in pending:
+                self._sse_write("data: " + json.dumps(
+                    chunk({"content": safe})) + "\n\n")
+            if not exhausted:
+                for d in gen:
+                    safe = filt.feed(d)
+                    if safe:
+                        self._sse_write("data: " + json.dumps(
+                            chunk({"content": safe})) + "\n\n")
+            full = filt.full_text
+            before, call = parse_tool_call(full)
+            rest = before[len(filt.emitted):] if call \
+                else full[len(filt.emitted):]
+            if rest:
+                self._sse_write("data: " + json.dumps(
+                    chunk({"content": rest})) + "\n\n")
+            finish = "stop"
+            if call:
+                tc = [{"index": 0,
+                       "id": "call_" + uuid.uuid4().hex[:24],
+                       "type": "function",
+                       "function": {
+                           "name": call.get("name"),
+                           "arguments": json.dumps(call.get("input") or {})}}]
+                self._sse_write("data: " + json.dumps(
+                    chunk({"tool_calls": tc})) + "\n\n")
+                finish = "tool_calls"
+            self._sse_write("data: " + json.dumps(chunk({}, finish)) + "\n\n")
+            self._sse_write("data: [DONE]\n\n")
+        except _ClientGone:
+            gen.close()
+            raise
+        except UpstreamError as e:
+            print(f"[proxy] upstream error mid-stream: {e.status}",
+                  flush=True)
+            try:
+                self._sse_write("data: " + json.dumps(
+                    {"error": {"message": f"upstream {e.status}",
+                               "type": "upstream_error"}}) + "\n\n")
+                self._sse_write("data: [DONE]\n\n")
+            except _ClientGone:
+                gen.close()
+                raise
+
+    def _anthropic_stream(self, body, system_text, turns, tools, extra):
+        gen = complete_iter(system_text, turns, tools, extra)
+        filt = ToolBlockFilter()
+        pending, exhausted = self._prime_stream(gen, filt)
+        msg_id = "msg_" + uuid.uuid4().hex[:24]
+
+        def ev(name, data):
+            self._sse_write(f"event: {name}\ndata: {json.dumps(data)}\n\n")
+
+        self._sse_open()
+        try:
+            ev("message_start", {
+                "type": "message_start",
+                "message": {"id": msg_id, "type": "message",
+                            "role": "assistant", "model": MODEL,
+                            "content": [], "stop_reason": None,
+                            "stop_sequence": None,
+                            "usage": {"input_tokens": 0,
+                                      "output_tokens": 0}}})
+            idx = 0
+            text_open = False
+
+            def text_delta(t):
+                nonlocal text_open
+                if not text_open:
+                    ev("content_block_start", {
+                        "type": "content_block_start", "index": idx,
+                        "content_block": {"type": "text", "text": ""}})
+                    text_open = True
+                ev("content_block_delta", {
+                    "type": "content_block_delta", "index": idx,
+                    "delta": {"type": "text_delta", "text": t}})
+
+            for safe in pending:
+                text_delta(safe)
+            if not exhausted:
+                for d in gen:
+                    safe = filt.feed(d)
+                    if safe:
+                        text_delta(safe)
+            full = filt.full_text
+            before, call = parse_tool_call(full)
+            rest = before[len(filt.emitted):] if call \
+                else full[len(filt.emitted):]
+            if rest:
+                text_delta(rest)
+            if text_open:
+                ev("content_block_stop", {
+                    "type": "content_block_stop", "index": idx})
+                idx += 1
+            stop = "end_turn"
+            if call:
+                tid = "toolu_" + uuid.uuid4().hex[:24]
+                ev("content_block_start", {
+                    "type": "content_block_start", "index": idx,
+                    "content_block": {"type": "tool_use", "id": tid,
+                                      "name": call.get("name"),
+                                      "input": {}}})
+                ev("content_block_delta", {
+                    "type": "content_block_delta", "index": idx,
+                    "delta": {"type": "input_json_delta",
+                              "partial_json": json.dumps(
+                                  call.get("input") or {})}})
+                ev("content_block_stop", {
+                    "type": "content_block_stop", "index": idx})
+                stop = "tool_use"
+            elif not text_open:
+                ev("content_block_start", {
+                    "type": "content_block_start", "index": idx,
+                    "content_block": {"type": "text", "text": ""}})
+                ev("content_block_stop", {
+                    "type": "content_block_stop", "index": idx})
+            ev("message_delta", {
+                "type": "message_delta",
+                "delta": {"stop_reason": stop, "stop_sequence": None},
+                "usage": {"output_tokens": 0}})
+            ev("message_stop", {"type": "message_stop"})
+        except _ClientGone:
+            gen.close()
+            raise
+        except UpstreamError as e:
+            print(f"[proxy] upstream error mid-stream: {e.status}",
+                  flush=True)
+            try:
+                ev("error", {"type": "error", "error": {
+                    "type": "upstream_error",
+                    "message": f"upstream {e.status}"}})
+            except _ClientGone:
+                gen.close()
+                raise
 
     def _openai(self, body):
         system_text, turns = turns_from_openai(body.get("messages") or [])
-        text = complete(system_text, turns, body.get("tools"), self._extra(body))
+        extra = self._extra(body)
+        if body.get("stream"):
+            self._openai_stream(body, system_text, turns, extra)
+            return
+        text = complete(system_text, turns, body.get("tools"), extra)
         before, call = parse_tool_call(text)
         msg = {"role": "assistant", "content": before or None}
         finish = "stop"
@@ -667,26 +1042,6 @@ class Handler(BaseHTTPRequestHandler):
             msg["tool_calls"] = tool_calls
             finish = "tool_calls"
         cid_ = "chatcmpl-" + uuid.uuid4().hex[:24]
-        if body.get("stream"):
-            # Buffered-then-chunked SSE (upstream text is fully collected
-            # because tool-call blocks must be parsed before responding).
-            delta = {"role": "assistant"}
-            if tool_calls:
-                delta["tool_calls"] = [dict(tc, index=0) for tc in tool_calls]
-            elif before:
-                delta["content"] = before
-            chunks = [
-                {"id": cid_, "object": "chat.completion.chunk",
-                 "created": int(time.time()), "model": MODEL,
-                 "choices": [{"index": 0, "delta": delta, "finish_reason": None}]},
-                {"id": cid_, "object": "chat.completion.chunk",
-                 "created": int(time.time()), "model": MODEL,
-                 "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]},
-            ]
-            body_out = "".join(f"data: {json.dumps(c)}\n\n" for c in chunks)
-            body_out += "data: [DONE]\n\n"
-            self._send(200, body_out, "text/event-stream")
-            return
         self._send(200, {
             "id": cid_,
             "object": "chat.completion", "created": int(time.time()),
@@ -699,7 +1054,11 @@ class Handler(BaseHTTPRequestHandler):
         system_text, turns = turns_from_anthropic(body.get("system"),
                                                   body.get("messages") or [])
         tools = anthropic_tools(body.get("tools"))
-        text = complete(system_text, turns, tools, self._extra(body))
+        extra = self._extra(body)
+        if body.get("stream"):
+            self._anthropic_stream(body, system_text, turns, tools, extra)
+            return
+        text = complete(system_text, turns, tools, extra)
         before, call = parse_tool_call(text)
         content = []
         if before:
@@ -714,41 +1073,6 @@ class Handler(BaseHTTPRequestHandler):
         if not content:
             content.append({"type": "text", "text": ""})
         msg_id = "msg_" + uuid.uuid4().hex[:24]
-        if body.get("stream"):
-            events = [("message_start", {
-                "type": "message_start",
-                "message": {"id": msg_id, "type": "message", "role": "assistant",
-                            "model": MODEL, "content": [],
-                            "stop_reason": None, "stop_sequence": None,
-                            "usage": {"input_tokens": 0, "output_tokens": 0}}})]
-            for i, block in enumerate(content):
-                if block["type"] == "text":
-                    events.append(("content_block_start", {
-                        "type": "content_block_start", "index": i,
-                        "content_block": {"type": "text", "text": ""}}))
-                    if block["text"]:
-                        events.append(("content_block_delta", {
-                            "type": "content_block_delta", "index": i,
-                            "delta": {"type": "text_delta",
-                                      "text": block["text"]}}))
-                else:
-                    events.append(("content_block_start", {
-                        "type": "content_block_start", "index": i,
-                        "content_block": {"type": "tool_use", "id": block["id"],
-                                          "name": block["name"], "input": {}}}))
-                    events.append(("content_block_delta", {
-                        "type": "content_block_delta", "index": i,
-                        "delta": {"type": "input_json_delta",
-                                  "partial_json": json.dumps(block["input"])}}))
-                events.append(("content_block_stop", {
-                    "type": "content_block_stop", "index": i}))
-            events.append(("message_delta", {
-                "type": "message_delta",
-                "delta": {"stop_reason": stop, "stop_sequence": None},
-                "usage": {"output_tokens": 0}}))
-            events.append(("message_stop", {"type": "message_stop"}))
-            self._send_sse(events)
-            return
         self._send(200, {
             "id": msg_id, "type": "message",
             "role": "assistant", "model": MODEL, "content": content,
@@ -756,10 +1080,20 @@ class Handler(BaseHTTPRequestHandler):
             "usage": {"input_tokens": 0, "output_tokens": 0}})
 
 
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError,
+                            _ClientGone)):
+            return  # a client hangup is not a server error
+        super().handle_error(request, client_address)
+
 if __name__ == "__main__":
     os.makedirs(os.path.dirname(TOKEN_FILE), exist_ok=True)
     _load_sessions()
-    srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    srv = Server(("127.0.0.1", PORT), Handler)
     print(f"mai_proxy on http://127.0.0.1:{PORT}  token_file={TOKEN_FILE} "
           f"token_loaded={bool(get_token())}", flush=True)
     srv.serve_forever()
