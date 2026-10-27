@@ -14,6 +14,7 @@ first run if needed.
 """
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -57,6 +58,17 @@ def start_proxy():
 
 
 def main():
+    # Singleton: hold a localhost port for the guardian's lifetime
+    # so an autostart entry and a manual launch cannot both run.
+    lock_port = int(os.environ.get("MAI2API_GUARDIAN_LOCK_PORT", "18790"))
+    lock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        lock.bind(("127.0.0.1", lock_port))
+        lock.listen(1)
+    except OSError:
+        print(f"another guardian already holds :{lock_port}; exiting",
+              flush=True)
+        return
     fails = 0
     while not os.path.exists(STOPFILE):
         pid = None

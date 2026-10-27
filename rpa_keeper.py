@@ -7,9 +7,11 @@ session itself -- so this keeper babysits the session with simple,
 dumb, periodic RPA:
 
   * a resident headless Edge on a dedicated profile (CDP 127.0.0.1),
-  * every pass reads /.auth/me; if the token is gone it drives the
-    Easy Auth login flow and handles the screens a raw navigation
-    cannot pass, with REAL mouse clicks over CDP:
+  * every pass reads /.auth/me and checks the JWT exp (a present
+    token string is not a fresh token: /.auth/me keeps returning the
+    expired token object); if the token is gone or no longer fresh
+    it drives the Easy Auth login flow and handles the screens a raw
+    navigation cannot pass, with REAL mouse clicks over CDP:
       - account picker: click the tile matching the learned account
         (name/domain stored in rpa_hints.json after a success),
       - "stay signed in" (KMSI): click Yes,
@@ -22,6 +24,7 @@ No credentials are ever typed: clicks only select/confirm what the
 signed-in session itself offers. Token values are never printed.
 """
 import asyncio
+import base64
 import json
 import os
 import subprocess
@@ -59,6 +62,26 @@ EDGE_FLAGS = [
     "--process-per-site", "--disk-cache-size=2097152",
     "--disable-gpu-shader-disk-cache", "--disable-gpu", "--noerrdialogs",
 ]
+
+
+REFRESH_THRESHOLD = int(os.environ.get("MAI2API_REFRESH_THRESHOLD", "600"))
+
+
+def jwt_exp(tok):
+    """Expiry (epoch seconds) of a JWT, or 0 when undecodable.
+    Presence of a token string is NOT freshness: /.auth/me keeps
+    returning the session's token object after it has expired, so
+    every acceptance decision must be made on exp."""
+    try:
+        p = tok.split(".")[1]
+        p += "=" * (-len(p) % 4)
+        return int(json.loads(base64.urlsafe_b64decode(p))["exp"])
+    except Exception:
+        return 0
+
+
+def seconds_left(tok):
+    return jwt_exp(tok) - int(time.time()) if tok else 0
 
 
 def http_json(url, method="GET", timeout=10):
@@ -232,21 +255,29 @@ async def keeper_pass(force_login=False):
         pg = Page(ws)
         await asyncio.sleep(2)
         tok, entry = await pg.me()
-        if tok and not force_login:
+        old_exp = jwt_exp(tok) if tok else 0
+        if tok and not force_login and \
+                old_exp - int(time.time()) > REFRESH_THRESHOLD:
             clicked = await pg.click_text(
                 ["新しいチャット", "new chat", "new conversation"])
             if not clicked:
                 await pg.click_xy(60, 60)  # harmless corner activity
-            print(f"pass: token present; keepalive click "
+            print(f"pass: token fresh "
+                  f"({old_exp - int(time.time())}s left); keepalive click "
                   f"({clicked or 'corner'})", flush=True)
             return tok, entry
-        print("pass: driving login flow", flush=True)
+        print(f"pass: token stale/absent "
+              f"({old_exp - int(time.time()) if tok else 'none'}s left); "
+              f"driving login flow", flush=True)
         await pg.eval(f"location.href = {json.dumps(LOGIN)}; 'nav'")
         hints = load_hints()
         for i in range(30):
             await asyncio.sleep(3)
             tok, entry = await pg.me()
-            if tok:
+            # Success requires a genuinely NEW token: the stale
+            # session object keeps answering /.auth/me with the old
+            # JWT, so accept only an exp that actually advanced.
+            if tok and jwt_exp(tok) > old_exp + 60:
                 break
             url = await pg.eval("location.href") or ""
             host = urllib.parse.urlparse(url).netloc
@@ -326,6 +357,16 @@ def handle_result(st, rc, err=None):
             st["alert"] = "needs_signin"
             st["last_notify"] = now
         st["consec"] = 0
+    elif rc == 1:  # stale token; refresh attempted and failed
+        st["consec"] = st.get("consec", 0) + 1
+        if st["consec"] >= 3 and (
+                st.get("alert") != "stale"
+                or now - st.get("last_notify", 0) > ALERT_EVERY):
+            notify("トークン更新失敗",
+                   f"期限切れトークンの更新が{st['consec']}回連続で"
+                   f"成功していません", priority="high")
+            st["alert"] = "stale"
+            st["last_notify"] = now
     elif err is not None:
         st["consec"] = st.get("consec", 0) + 1
         if st["consec"] >= 3 and (
@@ -336,8 +377,8 @@ def handle_result(st, rc, err=None):
                    f"（{err}）", priority="high")
             st["alert"] = "failures"
             st["last_notify"] = now
-    else:  # delivered (rc 0 or 1)
-        if st.get("alert") == "needs_signin":
+    else:  # rc == 0: a fresh token was delivered
+        if st.get("alert") in ("needs_signin", "stale", "failures"):
             notify("復旧", "トークン収穫が再開しました")
         st["alert"] = None
         st["consec"] = 0
@@ -349,8 +390,14 @@ def one_pass(force_login=False):
     if not tok:
         print("pass: NEEDS_SIGNIN (flow did not complete)", flush=True)
         return 2
+    if seconds_left(tok) <= REFRESH_THRESHOLD:
+        # Never deliver a stale token as if it were a harvest: that
+        # was the loop that kept an expired JWT in circulation.
+        print(f"pass: refresh failed; token still stale "
+              f"({seconds_left(tok)}s left)", flush=True)
+        return 1
     left = deliver(tok, entry)
-    return 0 if left and left > 600 else 1
+    return 0 if left and left > REFRESH_THRESHOLD else 1
 
 
 def main():

@@ -33,6 +33,7 @@ Usage:
   python headless_harvest.py --port N   # custom CDP port
 """
 import asyncio
+import base64
 import json
 import os
 import subprocess
@@ -78,6 +79,23 @@ EDGE_FLAGS = [
     "--disable-gpu",
     "--noerrdialogs",
 ]
+
+
+REFRESH_THRESHOLD = int(os.environ.get("MAI2API_REFRESH_THRESHOLD", "600"))
+
+
+def jwt_exp(tok):
+    """Expiry (epoch seconds) of a JWT, or 0 when undecodable.
+    /.auth/me keeps returning the session's token object after it
+    has expired, so a returned token string is not proof of a live
+    session: only accept tokens whose exp is comfortably ahead,
+    and after a refresh only one whose exp actually advanced."""
+    try:
+        p = tok.split(".")[1]
+        p += "=" * (-len(p) % 4)
+        return int(json.loads(base64.urlsafe_b64decode(p))["exp"])
+    except Exception:
+        return 0
 
 
 def http_json(url, method="GET", timeout=10):
@@ -185,11 +203,21 @@ async def harvest_once():
         # then returns a fresh id_token.
         tok = None
         kicked = False
+        stale_exp = 0
         for i in range(24):
             await asyncio.sleep(3)
-            tok = await read_token()
-            if tok:
-                break
+            cand = await read_token()
+            if cand:
+                e = jwt_exp(cand)
+                if e - int(time.time()) > REFRESH_THRESHOLD and \
+                        e > stale_exp:
+                    tok = cand
+                    break
+                if not stale_exp:
+                    stale_exp = e
+                    print(f"token present but stale "
+                          f"({e - int(time.time())}s left); refreshing",
+                          flush=True)
             if i == 3 and not kicked:
                 kicked = True
                 await ev(f"location.href = {json.dumps(LOGIN)}; 'nav'")

@@ -71,7 +71,7 @@ SESSIONS_FILE = os.path.join(_HERE, "sessions.json")
 MAX_STREAMS = int(os.environ.get("MAI_PROXY_MAX_STREAMS", "3"))
 _stream_sem = threading.Semaphore(MAX_STREAMS)
 STUFF_CHAR_CAP = int(os.environ.get("MAI_PROXY_STUFF_CAP", "280000"))
-TOKEN_WAIT_SECONDS = int(os.environ.get("MAI_PROXY_TOKEN_WAIT", "150"))
+TOKEN_WAIT_SECONDS = int(os.environ.get("MAI_PROXY_TOKEN_WAIT", "90"))
 
 
 def get_token():
@@ -87,17 +87,18 @@ def token_info():
     only used for status display and renewal timing)."""
     tok = get_token()
     if not tok:
-        return {"loaded": False}
+        return {"loaded": False, "valid": False}
     try:
         import base64
         payload = tok.split(".")[1]
         payload += "=" * (-len(payload) % 4)
         claims = json.loads(base64.urlsafe_b64decode(payload))
         exp = claims.get("exp")
-        return {"loaded": True, "expires_at": exp,
-                "seconds_left": int(exp - time.time()) if exp else None}
+        left = int(exp - time.time()) if exp else None
+        return {"loaded": True, "expires_at": exp, "seconds_left": left,
+                "valid": bool(left and left > 30)}
     except Exception:  # noqa: BLE001
-        return {"loaded": True}
+        return {"loaded": True, "valid": False}
 
 
 _last_harvest_spawn = [0.0]
@@ -242,6 +243,12 @@ class UpstreamError(Exception):
         super().__init__(f"upstream {status}: {body}")
         self.status = status
         self.body = body
+
+
+class AuthUnavailable(Exception):
+    """No usable Playground token and the bounded refresh wait did
+    not land one. Mapped to a 503 so a dead session fails fast and
+    machine-readably instead of hanging on a doomed upstream call."""
 
 
 def trpc(name, payload, idempotent=False):
@@ -460,8 +467,14 @@ def complete(system_text, turns, tools, extra):
     if not turns:
         raise ValueError("no messages")
     info = token_info()
-    if not info.get("loaded") or (info.get("seconds_left") or 0) <= 0:
-        wait_for_fresh_token()
+    if not info.get("valid"):
+        # Missing, expired or nearly expired token: wait ONE bounded
+        # window for the keeper / an on-demand harvest to land a
+        # fresh token. If none lands, fail fast with a 503 instead
+        # of feeding a dead token to the upstream and hanging.
+        if not wait_for_fresh_token():
+            raise AuthUnavailable(
+                "Playground session token could not be refreshed")
     tok_before = get_token()
     with _stream_sem:
         try:
@@ -471,7 +484,7 @@ def complete(system_text, turns, tools, extra):
                 raise
             print("[proxy] upstream auth error; waiting for a fresh "
                   "token, then retrying once", flush=True)
-            if not wait_for_fresh_token(old_value=tok_before, timeout=120):
+            if not wait_for_fresh_token(old_value=tok_before, timeout=90):
                 raise
             return _complete_inner(system_text, turns, tools, extra)
 
@@ -566,8 +579,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?", 1)[0]
-        if path == "/health":
-            self._send(200, {"ok": True, "token": token_info()})
+        if path in ("/health", "/health/live", "/health/ready"):
+            info = token_info()
+            summary = {"ok": bool(info.get("valid")),
+                       "process": "ok", "token": info}
+            if path == "/health/live":
+                self._send(200, {"ok": True, "process": "ok"})
+            elif path == "/health/ready":
+                self._send(200 if info.get("valid") else 503, summary)
+            else:
+                self._send(200, summary)
         elif path == "/v1/models":
             self._send(200, {"object": "list", "data": [
                 {"id": MODEL, "object": "model", "owned_by": "microsoft-mai"}]})
@@ -601,6 +622,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, {"input_tokens": approx})
             else:
                 self._send(404, {"error": "not found"})
+        except AuthUnavailable as e:
+            self._send(503, {"error": {"message": str(e),
+                                       "type": "mai_auth_unavailable"}})
         except UpstreamError as e:
             self._send(502, {"error": {"message":
                 f"upstream {e.status}: {e.body}. If 401/403, the Playground "
