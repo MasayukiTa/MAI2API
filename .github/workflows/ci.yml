@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Compile all modules
+        run: python -m compileall -q .
+
+      - name: Guard - no tracked secrets or live state
+        shell: pwsh
+        run: |
+          $badNames = '^(token\.txt|sessions\.json|session_cookies\.json|auth_params\.json|msal_cache\.json|device_token\.txt|device_prompt\.txt|notify_config\.json|keeper_state\.json|rpa_hints\.json)$'
+          $badPaths = 'edge-profile/|\.msalenv/|local-rd/|\.log$|\.pid$|_stop\.txt$'
+          $tracked = git ls-files
+          $hits = $tracked | Select-String -Pattern $badNames, $badPaths
+          if ($hits) {
+            $hits | ForEach-Object { Write-Error "must not be tracked: $_" }
+            exit 1
+          }
+          Write-Host "tracked-file guard: clean ($($tracked.Count) files)"
+
+      - name: Guard - no credential-shaped content
+        shell: pwsh
+        run: |
+          $hits = git grep -n -E "eyJ[A-Za-z0-9_-]{20,}|BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY" -- . 2>$null
+          if ($hits) {
+            $hits | ForEach-Object { Write-Error "credential-shaped content: $_" }
+            exit 1
+          }
+          Write-Host "content guard: clean"
+
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
