@@ -400,6 +400,38 @@ def one_pass(force_login=False):
     return 0 if left and left > REFRESH_THRESHOLD else 1
 
 
+class _RotatingStdout:
+    """File-backed stdout for --loop mode with size rotation, so a
+    resident keeper cannot grow its log without bound."""
+
+    def __init__(self, path, max_bytes=5 * 1024 * 1024, backups=2):
+        self.path = path
+        self.max_bytes = max_bytes
+        self.backups = backups
+        self.f = open(path, "a", encoding="utf-8", errors="replace")
+
+    def write(self, s):
+        n = self.f.write(s)
+        try:
+            if self.f.tell() > self.max_bytes:
+                self._rotate()
+        except Exception:  # noqa: BLE001
+            pass
+        return n
+
+    def _rotate(self):
+        self.f.close()
+        for i in range(self.backups, 0, -1):
+            src = f"{self.path}.{i - 1}" if i > 1 else self.path
+            dst = f"{self.path}.{i}"
+            if os.path.exists(src):
+                os.replace(src, dst)
+        self.f = open(self.path, "a", encoding="utf-8", errors="replace")
+
+    def flush(self):
+        self.f.flush()
+
+
 def main():
     if "--loop" in sys.argv:
         # Singleton: hold a localhost port for the loop's lifetime so
@@ -413,6 +445,11 @@ def main():
             print("another keeper loop already holds :18789; exiting",
                   flush=True)
             return 0
+        # From here the loop owns its log file (with rotation); the
+        # launcher's shell redirect only captured startup lines.
+        _log = _RotatingStdout(os.path.join(HERE, "rpa_loop.log"))
+        sys.stdout = _log
+        sys.stderr = _log
         interval = 240
         st = _load_state()
         while not os.path.exists(STOP):

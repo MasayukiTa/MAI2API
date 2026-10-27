@@ -81,6 +81,27 @@ STUFF_CHAR_CAP = int(os.environ.get("MAI_PROXY_STUFF_CAP", "280000"))
 TOKEN_WAIT_SECONDS = int(os.environ.get("MAI_PROXY_TOKEN_WAIT", "90"))
 
 
+_log_check_at = [0.0]
+
+
+def _maybe_rotate_requests_log():
+    """Size-cap requests.log (checked at most hourly; the file is
+    opened per request, so rotation between writes is race-light).
+    The guardian also rotates it whenever it starts the proxy."""
+    now = time.time()
+    if now - _log_check_at[0] < 3600:
+        return
+    _log_check_at[0] = now
+    try:
+        if os.path.getsize(REQUESTS_LOG) > 5 * 1024 * 1024:
+            for src, dst in ((REQUESTS_LOG + ".1", REQUESTS_LOG + ".2"),
+                             (REQUESTS_LOG, REQUESTS_LOG + ".1")):
+                if os.path.exists(src):
+                    os.replace(src, dst)
+    except OSError:
+        pass
+
+
 def get_token():
     try:
         with open(TOKEN_FILE, encoding="utf-8") as f:
@@ -722,6 +743,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             with open(REQUESTS_LOG, "a", encoding="utf-8") as f:
                 f.write(fmt % args + "\n")
+            _maybe_rotate_requests_log()
         except OSError:
             pass
 
