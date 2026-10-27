@@ -16,13 +16,6 @@ if (-not $pyw) { throw "Python 3 was not found on PATH. Install Python 3 first."
 $py = $pyw -replace "pythonw\.exe$", "python.exe"
 Write-Host "Python: $py"
 
-# --- dependency: websockets (CDP driver for the harvester/keeper) ---
-& $py -c "import websockets" 2>$null
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "Installing websockets..."
-    & $py -m pip install websockets
-}
-
 # --- runtime state directory (outside the source tree) ---
 # Token, browser profile, sessions and logs live in
 # %LOCALAPPDATA%\MAI2API (or $env:MAI2API_STATE_DIR when set), so the
@@ -47,6 +40,27 @@ if ((Test-Path $oldProfile) -and -not (Test-Path $newProfile)) {
     Write-Host "Migrated the browser profile to the state directory."
 }
 Write-Host "State directory: $state"
+
+# --- dedicated virtual environment (in the state directory) ---
+# The components run from a private venv with pinned dependencies:
+# never from whatever interpreter happens to be on PATH, and never
+# from another project's environment.
+$venv = Join-Path $state ".venv"
+$venvPyw = Join-Path $venv "Scripts\pythonw.exe"
+if (-not (Test-Path $venvPyw)) {
+    Write-Host "Creating the dedicated venv in the state directory..."
+    & $py -m venv $venv
+}
+if (Test-Path $venvPyw) {
+    & (Join-Path $venv "Scripts\python.exe") -m pip install -r (Join-Path $here "requirements.txt") | Out-Null
+    $pyw = $venvPyw
+    $py = Join-Path $venv "Scripts\python.exe"
+    Write-Host "Venv: $venv"
+} else {
+    Write-Host "WARNING: venv creation failed; falling back to $py"
+    & $py -c "import websockets" 2>$null
+    if ($LASTEXITCODE -ne 0) { & $py -m pip install -r (Join-Path $here "requirements.txt") }
+}
 
 # --- auto-start at logon (HKCU Run keys, no elevation needed) ---
 # The guardian supervises the proxy; the keeper supervises the token.

@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mai2api"
+version = "1.0.0"
+description = "Turn Microsoft AI Playground's MAI-Thinking-1 into a local OpenAI/Anthropic-compatible API"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+# The only runtime dependency: the keeper/harvester drive a headless
+# Edge over CDP. The proxy itself is standard-library only.
+dependencies = ["websockets==15.0.1"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+# The components run as standalone scripts (see setup.ps1); the
+# module list exists so the metadata is complete and tooling can
+# resolve the project.
+[tool.setuptools]
+py-modules = [
+    "mai_proxy",
+    "rpa_keeper",
+    "headless_harvest",
+    "guardian",
+    "notify",
+    "selftest",
+    "harvest_now",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
