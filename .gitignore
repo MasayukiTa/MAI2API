@@ -1,0 +1,29 @@
+# credentials and live state - never commit
+token.txt
+sessions.json
+sessions.json.tmp
+session_cookies.json
+auth_params.json
+msal_cache.json
+device_token.txt
+device_prompt.txt
+notify_config.json
+keeper_state.json
+rpa_hints.json
+
+# browser profile, venvs, bytecode
+edge-profile/
+.msalenv/
+__pycache__/
+*.pyc
+
+# runtime byproducts
+*.log
+*.pid
+harvest_stop.txt
+rpa_stop.txt
+guardian_stop.txt
+
+# local experiments and scratch
+local-rd/
+*_out.txt

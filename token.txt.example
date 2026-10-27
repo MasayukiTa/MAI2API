@@ -1,0 +1,5 @@
+Paste an Easy Auth id_token (a JWT, one single line, no quotes) into token.txt.
+Normally you never do this by hand: run the one-time sign-in
+(python harvest_now.py --setup) and the keeper keeps token.txt fresh.
+A token can also be POSTed to http://127.0.0.1:18787/__harvest .
+Never commit a real token.
